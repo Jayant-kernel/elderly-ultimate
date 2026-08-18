@@ -1,19 +1,15 @@
-import { mulawToPcm16, pcm16ToMulaw } from "./audio/mulaw.mjs";
-import { Upsampler, Downsampler } from "./audio/resample.mjs";
-import { base64ToInt16 } from "./audio/pcm.mjs";
 import { logger } from "./log.mjs";
 
 const log = logger("call-bridge");
-const TWILIO_RATE = 8000;
-const PIPELINE_RATE = 24000;
 const OUT_FRAME_MS = 20;
-const OUT_FRAME_SAMPLES_8K = (TWILIO_RATE * OUT_FRAME_MS) / 1000; // 160
+const OUT_FRAME_BYTES = 160; // 20 ms of mu-law @ 8 kHz
 
 /**
  * CallBridge — one instance per phone call. Owns ALL telephony details:
- *   Twilio Media Streams JSON protocol, mu-law <-> PCM16, 8k <-> 24k resampling,
- *   outbound pacing (20 ms frames), barge-in clear, mark/flush.
- * The pipeline only ever sees PCM16 @ 24 kHz. All state is per-instance.
+ *   Twilio Media Streams JSON protocol, base64 framing, outbound pacing
+ *   (20 ms frames), barge-in clear, mark/flush, generation-id gating.
+ * Audio crosses the pipeline boundary as raw mu-law 8 kHz bytes in BOTH
+ * directions — zero codec/resample work on this path. All state per-instance.
  */
 export class CallBridge {
   constructor({ ws, pipeline, callId, onEnd }) {
@@ -23,12 +19,12 @@ export class CallBridge {
     this.onEnd = onEnd || (() => {});
     this.streamSid = null;
     this.customParameters = {};
-    this.up = new Upsampler(TWILIO_RATE, PIPELINE_RATE);
-    this.down = new Downsampler(PIPELINE_RATE, TWILIO_RATE);
     this.outQueue = []; // Buffers of mu-law, 160 bytes each
     this.outPartial = new Uint8Array(0);
     this.outTimer = null;
-    this.stats = { inFrames: 0, outFrames: 0, bargeIns: 0, startedAt: Date.now() };
+    this.lastGenId = null; // generation of the most recent outbound audio
+    this.cancelledGens = new Set(); // generations killed by barge-in; late frames dropped
+    this.stats = { inFrames: 0, outFrames: 0, bargeIns: 0, droppedFrames: 0, startedAt: Date.now() };
     this.ended = false;
     this.wirePipeline();
     this.wireSocket();
@@ -40,7 +36,7 @@ export class CallBridge {
       log.info("pipeline ready", { callId: this.callId });
       this.pipeline.createResponse(this.customParameters.greeting || "greet");
     });
-    p.on("audio", (b64) => this.enqueueOutbound(base64ToInt16(b64)));
+    p.on("audio", (bytes, genId) => this.enqueueOutbound(bytes, genId));
     p.on("speech_started", () => this.handleBargeIn());
     p.on("response_done", () => this.sendMark("response_done"));
     p.on("transcript", (t) => log.info("transcript", { callId: this.callId, ...t }));
@@ -80,10 +76,8 @@ export class CallBridge {
       case "media": {
         if (msg.media && msg.media.track && msg.media.track !== "inbound") return;
         this.stats.inFrames++;
-        const mulaw = Buffer.from(msg.media.payload, "base64");
-        const pcm8k = mulawToPcm16(mulaw);
-        const pcm24k = this.up.process(pcm8k);
-        this.pipeline.appendAudio(pcm24k);
+        // mu-law bytes pass through untouched — the pipeline owns everything after this
+        this.pipeline.appendAudio(Buffer.from(msg.media.payload, "base64"));
         break;
       }
       case "mark":
@@ -100,17 +94,27 @@ export class CallBridge {
     }
   }
 
-  /** PCM16@24k -> mu-law 8k, sliced into 160-byte (20 ms) frames, paced out. */
-  enqueueOutbound(pcm24k) {
-    const pcm8k = this.down.process(pcm24k);
-    const mulaw = pcm16ToMulaw(pcm8k);
-    const buf = new Uint8Array(this.outPartial.length + mulaw.length);
+  /**
+   * mu-law 8k bytes -> 160-byte (20 ms) frames, paced out.
+   * Frames of a cancelled generation are dropped, never forwarded — this is the
+   * defence against vendors that flush (not discard) on cancel.
+   */
+  enqueueOutbound(bytes, genId) {
+    if (genId != null) {
+      if (this.cancelledGens.has(genId)) {
+        this.stats.droppedFrames++;
+        log.debug("dropped cancelled-generation audio", { callId: this.callId, genId, bytes: bytes.length });
+        return;
+      }
+      this.lastGenId = genId;
+    }
+    const buf = new Uint8Array(this.outPartial.length + bytes.length);
     buf.set(this.outPartial, 0);
-    buf.set(mulaw, this.outPartial.length);
+    buf.set(bytes, this.outPartial.length);
     let off = 0;
-    while (buf.length - off >= OUT_FRAME_SAMPLES_8K) {
-      this.outQueue.push(Buffer.from(buf.subarray(off, off + OUT_FRAME_SAMPLES_8K)));
-      off += OUT_FRAME_SAMPLES_8K;
+    while (buf.length - off >= OUT_FRAME_BYTES) {
+      this.outQueue.push(Buffer.from(buf.subarray(off, off + OUT_FRAME_BYTES)));
+      off += OUT_FRAME_BYTES;
     }
     this.outPartial = buf.subarray(off);
     this.startPacer();
@@ -128,10 +132,11 @@ export class CallBridge {
 
   handleBargeIn() {
     this.stats.bargeIns++;
+    if (this.lastGenId != null) this.cancelledGens.add(this.lastGenId);
     this.outQueue.length = 0;
     this.outPartial = new Uint8Array(0);
     this.sendJson({ event: "clear", streamSid: this.streamSid });
-    log.info("barge-in: cleared", { callId: this.callId });
+    log.info("barge-in: cleared", { callId: this.callId, cancelledGen: this.lastGenId });
   }
 
   sendMark(name) {

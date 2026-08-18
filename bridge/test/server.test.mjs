@@ -15,6 +15,7 @@ test("server: /health responds and a real WebSocket call receives the chime", as
   const health = await fetch(`http://127.0.0.1:${port}/health`).then((r) => r.json());
   assert.equal(health.ok, true);
   assert.equal(health.pipeline, "tone");
+  assert.deepEqual(health.vendors, {}, "/health must expose the per-vendor lastError registry");
 
   const ws = new WebSocket(`ws://127.0.0.1:${port}/media`);
   await new Promise((r) => ws.on("open", r));

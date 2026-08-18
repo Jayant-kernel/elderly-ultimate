@@ -52,33 +52,42 @@ test("full Twilio handshake: start -> greeting chime is paced out as 160-byte mu
   assert.equal(bridge.ended, true);
 });
 
-test("inbound media is decoded, upsampled and delivered to the pipeline at 24 kHz", async () => {
+test("inbound mu-law bytes cross the pipeline boundary untouched (zero resampling on the main path)", async () => {
   const ws = new FakeSocket();
   const pipeline = new TonePipeline({ callId: "t2" });
   const got = [];
   const origAppend = pipeline.appendAudio.bind(pipeline);
-  pipeline.appendAudio = (s) => { got.push(s.length); origAppend(s); };
+  pipeline.appendAudio = (b) => { got.push(Buffer.from(b)); origAppend(b); };
   new CallBridge({ ws, pipeline, callId: "t2" });
   ws.receive({ event: "start", streamSid: "MZ1", start: { streamSid: "MZ1" } });
   const frame8k = tone({ freqHz: 300, ms: 20, sampleRate: 8000, amplitude: 0.2 }); // 160 samples
-  const payload = Buffer.from(pcm16ToMulaw(frame8k)).toString("base64");
-  ws.receive({ event: "media", media: { track: "inbound", payload } });
-  ws.receive({ event: "media", media: { track: "inbound", payload } });
-  assert.deepEqual(got, [480, 480]);
+  const mulaw = Buffer.from(pcm16ToMulaw(frame8k));
+  ws.receive({ event: "media", media: { track: "inbound", payload: mulaw.toString("base64") } });
+  ws.receive({ event: "media", media: { track: "inbound", payload: mulaw.toString("base64") } });
+  assert.equal(got.length, 2);
+  for (const g of got) assert.deepEqual(g, mulaw, "bridge must pass the exact mu-law bytes through");
   ws.receive({ event: "stop" });
 });
 
-test("barge-in: speech_started clears the outbound queue and sends a clear frame", async () => {
+test("barge-in: clear sent, queue emptied, and the cancelled generation's late flush is dropped", async () => {
   const ws = new FakeSocket();
   const pipeline = new TonePipeline({ callId: "t3" });
   const bridge = new CallBridge({ ws, pipeline, callId: "t3" });
   ws.receive({ event: "start", streamSid: "MZ9", start: { streamSid: "MZ9" } });
-  await sleep(150); // chime playing, queue populated
+  await sleep(150); // chime (gen-1) playing, queue populated
   assert.ok(bridge.outQueue.length > 0, "queue should hold pending frames");
+  pipeline.cancelResponse();
   pipeline.emit("speech_started");
   assert.equal(bridge.outQueue.length, 0);
   assert.ok(ws.sent.some((m) => m.event === "clear" && m.streamSid === "MZ9"));
   assert.equal(bridge.stats.bargeIns, 1);
+  // late flush from the cancelled generation (the ElevenLabs close_context gotcha)
+  pipeline.emit("audio", new Uint8Array(320), "gen-1");
+  assert.equal(bridge.outQueue.length, 0, "cancelled-generation audio must never reach the caller");
+  assert.ok(bridge.stats.droppedFrames > 0);
+  // a fresh generation flows normally
+  pipeline.emit("audio", new Uint8Array(320), "gen-2");
+  assert.equal(bridge.outQueue.length, 2);
   ws.receive({ event: "stop" });
 });
 

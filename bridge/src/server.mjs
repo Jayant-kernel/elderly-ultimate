@@ -13,6 +13,10 @@ const log = logger("server");
 export function createServer(opts = {}) {
   const pipelineKind = opts.pipeline || config.pipeline;
   const calls = new Map();
+  const vendors = {}; // per-vendor last error, surfaced on /health for silent-death diagnosis
+  const reportVendor = (name, err) => {
+    vendors[name] = { lastError: err == null ? null : String(err.message || err), at: new Date().toISOString() };
+  };
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -23,6 +27,7 @@ export function createServer(opts = {}) {
         pipeline: pipelineKind,
         activeCalls: calls.size,
         uptimeSec: Math.round(process.uptime()),
+        vendors,
       }));
       return;
     }
@@ -43,7 +48,7 @@ export function createServer(opts = {}) {
     log.info("ws connection", { callId, activeCalls: calls.size + 1 });
     let pipeline;
     try {
-      pipeline = createPipeline(pipelineKind, { callId });
+      pipeline = createPipeline(pipelineKind, { callId, reportVendor });
     } catch (e) {
       log.error("pipeline create failed", { callId, err: String(e.message) });
       ws.close();
