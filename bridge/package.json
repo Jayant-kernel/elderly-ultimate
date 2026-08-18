@@ -1,0 +1,16 @@
+{
+  "name": "saathi-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "harness": "node tools/fake-twilio.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
