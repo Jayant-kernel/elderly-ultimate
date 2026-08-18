@@ -32,7 +32,7 @@ test("full Twilio handshake: start -> greeting chime is paced out as 160-byte mu
   ws.receive({ event: "connected", protocol: "Call" });
   ws.receive({ event: "start", streamSid: "MZ123", start: { streamSid: "MZ123", customParameters: { greeting: "hi" } } });
 
-  await sleep(1500); // chime is ~1.07 s
+  await sleep(2000); // chime is ~1.07 s nominal; Windows timer jitter stretches the 20 ms ticks
   const frames = ws.mediaFrames();
   assert.ok(frames.length > 40, `expected many media frames, got ${frames.length}`);
   for (const f of frames) {

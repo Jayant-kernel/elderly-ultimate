@@ -12,11 +12,12 @@ const OUT_FRAME_BYTES = 160; // 20 ms of mu-law @ 8 kHz
  * directions — zero codec/resample work on this path. All state per-instance.
  */
 export class CallBridge {
-  constructor({ ws, pipeline, callId, onEnd }) {
+  constructor({ ws, pipeline, callId, onEnd, validateStart }) {
     this.ws = ws;
     this.pipeline = pipeline;
     this.callId = callId;
     this.onEnd = onEnd || (() => {});
+    this.validateStart = validateStart || null;
     this.streamSid = null;
     this.customParameters = {};
     this.outQueue = []; // Buffers of mu-law, 160 bytes each
@@ -67,6 +68,11 @@ export class CallBridge {
         this.streamSid = msg.streamSid || (msg.start && msg.start.streamSid) || null;
         this.customParameters = (msg.start && msg.start.customParameters) || {};
         log.info("stream start", { callId: this.callId, streamSid: this.streamSid, params: Object.keys(this.customParameters) });
+        if (this.validateStart && !this.validateStart(this.customParameters)) {
+          log.warn("start rejected: bad call token", { callId: this.callId });
+          this.end("start_rejected");
+          return;
+        }
         Promise.resolve(this.pipeline.connect({ customParameters: this.customParameters })).catch((e) => {
           log.error("pipeline connect failed", { callId: this.callId, err: String(e && e.message ? e.message : e) });
           this.end("pipeline_connect_failed");
